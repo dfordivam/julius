@@ -41,6 +41,15 @@
 #include <sent/stddefs.h>
 #include <sent/mfcc.h>
 
+int readMelFilterBankData(float** mfcc, int frame_num)
+{
+  int i = 0;
+  FILE* fp = fopen("melfilter.data", "r");
+  for (; i < frame_num ; ++i){
+    fread((void*)mfcc[i],4*40,1,fp);
+  }
+}
+
 /** 
  * Convert wave data to MFCC.  Also does spectral subtraction
  * if @a ssbuf specified.
@@ -71,17 +80,21 @@ Wav2MFCC(SP16 *wave, float **mfcc, Value *para, int nSamples, MFCCWork *w, CMNWo
 
   frame_num = (int)((nSamples - para->framesize) / para->frameshift) + 1;
   
-  for(t = 0; t < frame_num; t++){
-    if(end != 0) start = end - (para->framesize - para->frameshift) - 1;
+  if (0) {
+    for(t = 0; t < frame_num; t++){
+      if(end != 0) start = end - (para->framesize - para->frameshift) - 1;
 
-    k = 1;
-    for(i = start; i <= start + para->framesize; i++){
-      w->bf[k] = (float)wave[i - 1];  k++;
+      k = 1;
+      for(i = start; i <= start + para->framesize; i++){
+        w->bf[k] = (float)wave[i - 1];  k++;
+      }
+      end = i;
+      
+      /* Calculate base MFCC coefficients */
+      WMP_calc(w, mfcc[t], para);
     }
-    end = i;
-    
-    /* Calculate base MFCC coefficients */
-    WMP_calc(w, mfcc[t], para);
+  } else {
+    readMelFilterBankData(mfcc,frame_num);
   }
   
   /* Normalise Log Energy */
