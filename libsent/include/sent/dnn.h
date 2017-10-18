@@ -27,6 +27,10 @@ typedef struct {
   float *b;			/* b [out] */
   int in;
   int out;
+#ifdef _OPENMP
+  int *begin;
+  int *end;
+#endif /* _OPENMP */
 } DNNLayer;
 
 typedef struct {
@@ -39,6 +43,7 @@ typedef struct {
   float prior_factor;		/* prior factor */
 
   int batch_size;		/* batch size */
+  int num_threads;              /* number of threads */
   
   int veclen;		  /* input vector length (before expansion) */
   int contextlen;	  /* context length */

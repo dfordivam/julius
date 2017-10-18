@@ -290,6 +290,9 @@ AC_SUBST(SIMD_SSE_CFLAGS)
 AC_SUBST(SIMD_NEONV2_CFLAGS)
 AC_SUBST(SIMD_NEON_CFLAGS)
 
+dnl Check for OPENMP availability
+AC_OPENMP()
+
 dnl Checks for programs.
 AC_PROG_INSTALL
 AC_PATH_PROG(RM, rm)
@@ -453,7 +456,7 @@ case $altype in
 	  ;;
         cygwin*|mingw*)
 	  AC_CHECK_LIB(dsound,main,
-	      AC_CHECK_HEADERS(DSound.h,
+	      AC_CHECK_HEADERS(dsound.h,
 	          altype="pa-dsound",
 		altype="pa-winmm"),
 	    altype="pa-winmm")

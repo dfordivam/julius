@@ -26,6 +26,9 @@
 
 #if defined(HAS_SIMD_FMA) || defined(HAS_SIMD_AVX) || defined(HAS_SIMD_SSE) || defined(HAS_SIMD_NEON) || defined(HAS_SIMD_NEONV2)
 #define SIMD_ENABLED
+#ifdef _OPENMP
+#include <omp.h>
+#endif /* _OPENMP */
 #endif
 
 static int use_simd = USE_SIMD_NONE;
@@ -372,10 +375,14 @@ static void dnn_layer_init(DNNLayer *l)
   l->b = NULL;
   l->in = 0;
   l->out = 0;
+#ifdef _OPENMP
+  l->begin = NULL;
+  l->end = NULL;
+#endif /* _OPENMP */
 }
 
 /* load dnn layer parameter from files */
-static boolean dnn_layer_load(DNNLayer *l, int in, int out, char *wfile, char *bfile)
+static boolean dnn_layer_load(DNNLayer *l, int in, int out, char *wfile, char *bfile, int thread_num)
 {
   l->in = in;
   l->out = out;
@@ -399,6 +406,25 @@ static boolean dnn_layer_load(DNNLayer *l, int in, int out, char *wfile, char *b
   if (! load_npy(l->b, bfile, l->out, 1)) return FALSE;
   jlog("Stat: dnn_layer_load: loaded %s\n", bfile);
 
+#ifdef _OPENMP
+  /* divide into thread chunks */
+  if (l->begin == NULL) {
+    l->begin = (int *)mymalloc(sizeof(int) * thread_num);
+  }
+  if (l->end == NULL) {
+    l->end = (int *)mymalloc(sizeof(int) * thread_num);
+  }
+  int num = l->out / thread_num;
+  /* padding base chunk size to factor of 4 for better SIMD processing */
+  num = ((num + 3) / 4) * 4;
+  int i;
+  for (i = 0; i < thread_num; i++) {
+    l->begin[i] = num * i;
+    l->end[i] = num * i + num;
+    if (l->end[i] > l->out) l->end[i] = l->out;
+  }
+#endif /* _OPENMP */
+
   return TRUE;
 }
 
@@ -412,6 +438,10 @@ static void dnn_layer_clear(DNNLayer *l)
   if (l->w != NULL) free(l->w);
   if (l->b != NULL) free(l->b);
 #endif	/* SIMD_ENABLED */
+#ifdef _OPENMP
+  if (l->begin != NULL) free(l->begin);
+  if (l->end != NULL) free(l->end);
+#endif /* _OPENMP */
   dnn_layer_init(l);
 }
 
@@ -482,7 +512,7 @@ sub1(float *dst, float *src, float *w, float *b, int out, int in, float *fstore)
 /************************************************************************/
 
 /* initialize dnn */
-boolean dnn_setup(DNNData *dnn, int veclen, int contextlen, int inputnodes, int outputnodes, int hiddennodes, int hiddenlayernum, char **wfile, char **bfile, char *output_wfile, char *output_bfile, char *priorfile, float prior_factor, int batchsize)
+boolean dnn_setup(DNNData *dnn, int veclen, int contextlen, int inputnodes, int outputnodes, int hiddennodes, int hiddenlayernum, char **wfile, char **bfile, char *output_wfile, char *output_bfile, char *priorfile, float prior_factor, int batchsize, int num_threads)
 {
   int i;
 
@@ -507,6 +537,17 @@ boolean dnn_setup(DNNData *dnn, int veclen, int contextlen, int inputnodes, int 
   dnn->hiddennodenum = hiddennodes;
   dnn->outputnodenum = outputnodes;
   dnn->prior_factor = prior_factor;
+  dnn->num_threads = num_threads;
+
+#ifdef _OPENMP
+  /* set number of threads */
+  int max_num_threads = omp_get_max_threads();
+  if (dnn->num_threads > max_num_threads) {
+    jlog("Warning: dnn_init: %d threads requested but available max is %d\n", dnn->num_threads, max_num_threads);
+    dnn->num_threads = max_num_threads;
+  }
+  jlog("Stat: dnn_init: use %d threads for DNN computation (max %d cores)\n", dnn->num_threads, max_num_threads);
+#endif /* OPENMP */
 
   /* check for input length */
   {
@@ -531,11 +572,11 @@ boolean dnn_setup(DNNData *dnn, int veclen, int contextlen, int inputnodes, int 
   dnn_layer_init(&(dnn->o));
 
   /* load layer parameters */
-  if (dnn_layer_load(&(dnn->h[0]), inputnodes, hiddennodes, wfile[0], bfile[0]) == FALSE) return FALSE;
+  if (dnn_layer_load(&(dnn->h[0]), inputnodes, hiddennodes, wfile[0], bfile[0], dnn->num_threads) == FALSE) return FALSE;
   for (i = 1; i < dnn->hnum; i++) {
-    if (dnn_layer_load(&(dnn->h[i]), hiddennodes, hiddennodes, wfile[i], bfile[i]) == FALSE) return FALSE;
+    if (dnn_layer_load(&(dnn->h[i]), hiddennodes, hiddennodes, wfile[i], bfile[i], dnn->num_threads) == FALSE) return FALSE;
   }
-  if (dnn_layer_load(&(dnn->o), hiddennodes, outputnodes, output_wfile, output_bfile) == FALSE) return FALSE;
+  if (dnn_layer_load(&(dnn->o), hiddennodes, outputnodes, output_wfile, output_bfile, dnn->num_threads) == FALSE) return FALSE;
 
   /* load state prior */
   {
@@ -577,7 +618,11 @@ boolean dnn_setup(DNNData *dnn, int veclen, int contextlen, int inputnodes, int 
   }
 #ifdef SIMD_ENABLED
   dnn->invec = (float *)mymalloc_simd_aligned(sizeof(float) * inputnodes);
+#ifdef _OPENMP
+  dnn->accum = (float *)mymalloc_simd_aligned(32 * dnn->num_threads);
+#else
   dnn->accum = (float *)mymalloc_simd_aligned(32);
+#endif /* OPENMP */
 #endif
 
   /* choose sub function */
@@ -614,10 +659,14 @@ boolean dnn_setup(DNNData *dnn, int veclen, int contextlen, int inputnodes, int 
 
 void dnn_calc_outprob(HMMWork *wrk)
 {
-  int hidx, i, n;
-  float *src, *dst;
-  DNNLayer *h;
+  float *src;
   DNNData *dnn = wrk->OP_dnn;
+#ifndef _OPENMP
+  int n = 0;
+  int hidx, i;
+  float *dst;
+  DNNLayer *h;
+#endif
 
   /* frame = wrk->OP_time */
   /* param = wrk->OP_param */
@@ -625,13 +674,47 @@ void dnn_calc_outprob(HMMWork *wrk)
   /* store state outprob to wrk->last_cache[]  */
 
   /* feed forward through hidden layers by standard logistic function */
-  n = 0;
+
 #ifdef SIMD_ENABLED
   memcpy(dnn->invec, &(wrk->OP_param->parvec[wrk->OP_time][0]), sizeof(float) * dnn->inputnodenum);
   src = dnn->invec;
 #else
   src = &(wrk->OP_param->parvec[wrk->OP_time][0]);
 #endif	/* SIMD_ENABLED */
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(dnn->num_threads)
+{
+  int n = 0;
+  int hidx, i;
+  float *lsrc, *dst;
+  DNNLayer *h;
+  int id = omp_get_thread_num();
+  int j;
+
+  dst = dnn->work[n];
+  lsrc = src;
+  for (hidx = 0; hidx < dnn->hnum; hidx++) {
+    h = &(dnn->h[hidx]);
+    (*dnn->subfunc)(dst + h->begin[id] , lsrc, h->w + h->begin[id] * h->in, h->b + h->begin[id], h->end[id] - h->begin[id], h->in, dnn->accum + id * 8);
+    for (j = h->begin[id] ; j < h->end[id]; j++) {
+      if (dst[j] <= -8.0f)
+	dst[j] = LOGISTIC_MIN;
+      else if (dst[j] >=  8.0f)
+	dst[j] = LOGISTIC_MAX;
+      else
+	dst[j] = logistic_table[(int)((dst[j] + 8.0f) * LOGISTIC_TABLE_FACTOR + 0.5)];
+    }
+#pragma omp barrier
+    lsrc = dst;
+    dst = dnn->work[++n];
+  }
+  /* compute output layer */
+  (*dnn->subfunc)(wrk->last_cache + dnn->o.begin[id] , lsrc, dnn->o.w + dnn->o.begin[id] * dnn->o.in, dnn->o.b + dnn->o.begin[id], dnn->o.end[id] - dnn->o.begin[id], dnn->o.in, dnn->accum + id * 8);
+}
+
+#else /* ~_OPENMP */
+
   dst = dnn->work[n];
   for (hidx = 0; hidx < dnn->hnum; hidx++) {
     h = &(dnn->h[hidx]);
@@ -640,12 +723,13 @@ void dnn_calc_outprob(HMMWork *wrk)
       dst[i] = logistic_func(dst[i]);
     }
     src = dst;
-    //if (++n > 1) n = 0;
     dst = dnn->work[++n];
   }
-  /* output layer */
+  /* compute output layer */
   (*dnn->subfunc)(wrk->last_cache, src, dnn->o.w, dnn->o.b, dnn->o.out, dnn->o.in, dnn->accum);
+#endif /* _OPENMP */  
 
+  
   /* do softmax */
   /* INV_LOG_TEN * (x - addlogarray(x)) - log10(state_prior)) */
 #ifdef NO_SUM_COMPUTATION
@@ -656,6 +740,7 @@ void dnn_calc_outprob(HMMWork *wrk)
 #else
   /* compute sum */
   {
+    int i;
     float logprob = addlog_array(wrk->last_cache, wrk->statenum);
     for (i = 0; i < wrk->statenum; i++) {
       wrk->last_cache[i] = INV_LOG_TEN * (wrk->last_cache[i] - logprob) - dnn->state_prior[i];
