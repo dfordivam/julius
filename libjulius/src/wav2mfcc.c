@@ -149,8 +149,19 @@ wav2mfcc(SP16 speech[], int speechlen, Recog *recog)
       mfcc->wrk->ss_floor = mfcc->frontend.ss_floor;
     }
   
+
+    {
+      // Divam - Copy data
+      int frame_num = (int)((speechlen - para->framesize) / para->frameshift) + 1;
+      char* melData = (char*) speech;
+      int i = 0;
+      int size = 4*40; // 40 float values per frame
+      for (; i < frame_num ; ++i){
+        memcpy((void*)(mfcc->param->parvec[i]), (void*) (&(melData [(i*size)])), size);
+      }
+    }
     /* make MFCC from speech data */
-    if (Wav2MFCC(speech, mfcc->param->parvec, para, speechlen, mfcc->wrk, mfcc->cmn.wrk) == FALSE) {
+    if (Wav2MFCC(NULL, mfcc->param->parvec, para, speechlen, mfcc->wrk, mfcc->cmn.wrk) == FALSE) {
       jlog("ERROR: failed to compute features from input speech\n");
       if (mfcc->frontend.sscalc) {
 	free(mfcc->frontend.ssbuf);

@@ -36,6 +36,8 @@ extern "C" {
 int j_open_stream(Recog *recog, char *file_or_dev_name);
 int j_close_stream(Recog *recog);
 int j_recognize_stream(Recog *recog);
+int j_recognize_stream_simplified(Recog *recog, char* melData, int speechlen);
+  void j_clean_recog_work_area(Recog* r);
 
 /* jfunc.c */
 void j_request_pause(Recog *recog);

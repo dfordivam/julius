@@ -1477,7 +1477,193 @@ j_recognize_stream_core(Recog *recog)
 
 }
 
-/** 
+int
+j_recognize_stream_simplified(Recog *recog, char* melData, int datalen)
+{
+  Jconf *jconf = recog->jconf;
+  int ret;
+  float seclen, mseclen;
+  RecogProcess *r;
+  MFCCCalc *mfcc;
+  PROCESS_AM *am;
+  PROCESS_LM *lm;
+  boolean ok_p;
+  boolean process_segment_last;
+  boolean on_the_fly = FALSE;
+  boolean pass2_p;
+
+  if (jconf->input.type == INPUT_WAVEFORM || jconf->input.speech_input == SP_MFCMODULE) {
+    for(mfcc=recog->mfcclist;mfcc;mfcc=mfcc->next) {
+      param_init_content(mfcc->param);
+    }
+  }
+
+  /* update initial recognition process status */
+  for(r=recog->process_list;r;r=r->next) {
+    if (r->active > 0) {
+      r->live = TRUE;
+    } else if (r->active < 0) {
+      r->live = FALSE;
+    }
+    r->active = 0;
+  }
+
+  /******************/
+  /* buffered input */
+  /******************/
+
+ /*************************/
+ /* buffered speech input */
+ /*************************/
+
+   /****************************************/
+   /* store raw speech samples to speech[] */
+   /****************************************/
+   recog->speechlen = speechlen;
+   // HACK send the ByteString ptr as SP16*
+   recog->speech = (SP16*) melData;
+   for(mfcc=recog->mfcclist;mfcc;mfcc=mfcc->next) {
+     param_init_content(mfcc->param);
+   }
+
+   /* output recorded length */
+   seclen = (float)recog->speechlen / (float)jconf->input.sfreq;
+   jlog("STAT: %d samples (%.2f sec.)\n", recog->speechlen, seclen);
+
+   /**********************************************/
+   /* acoustic analysis and encoding of speech[] */
+   /**********************************************/
+   jlog("STAT: Obtained Mel Filter Data)\n");
+   /* CMN will be computed for the whole buffered input */
+   if (wav2mfcc(recog->speech, recog->speechlen, recog) == FALSE) {
+     return -1;
+   }
+
+   /* output frame length */
+   callback_exec(CALLBACK_STATUS_PARAM, recog);
+
+#ifdef ENABLE_PLUGIN
+/* call post-process plugin if exist */
+plugin_exec_vector_postprocess_all(recog->mfcclist->param);
+#endif
+
+if (!jconf->decodeopt.realtime_flag) {
+ /* prepare for outprob cache for each HMM state and time frame */
+ /* assume all MFCCCalc has params of the same sample num */
+ for(am=recog->amlist;am;am=am->next) {
+   outprob_prepare(&(am->hmmwrk), am->mfcc->param->samplenum);
+ }
+ }
+
+
+if (get_back_trellis(recog) == FALSE) {
+ jlog("ERROR: fatal error occured, program terminates now\n");
+ return -1;
+ }
+/* execute callback for 1st pass result */
+/* result.status <0 must be skipped inside callback */
+callback_exec(CALLBACK_RESULT_PASS1, recog);
+
+/* execute callback at end of pass1 */
+if (recog->triggered) {
+ callback_exec(CALLBACK_EVENT_PASS1_END, recog);
+ }
+
+/* END OF BUFFERED 1ST PASS */
+
+ pass2_p = TRUE;
+if (pass2_p) callback_exec(CALLBACK_EVENT_PASS2_BEGIN, recog);
+
+#if !defined(PASS2_STRICT_IWCD) || defined(FIX_35_PASS2_STRICT_SCORE)
+/* adjust trellis score not to contain outprob of the last frames */
+ for(r=recog->process_list;r;r=r->next) {
+   if (!r->live) continue;
+   /* if [-1pass] is specified, skip 2nd pass */
+   if (r->config->compute_only_1pass) continue;
+   /* if search already failed on 1st pass, skip 2nd pass */
+   if (r->result.status < 0) continue;
+   if (! r->am->hmminfo->multipath) {
+     bt_discount_pescore(r->wchmm, r->backtrellis, r->am->mfcc->param);
+   }
+#ifdef LM_FIX_DOUBLE_SCORING
+   if (r->lmtype == LM_PROB) {
+     bt_discount_lm(r->backtrellis);
+   }
+#endif
+ }
+#endif
+
+    /* execute stack-decoding search */
+    for(r=recog->process_list;r;r=r->next) {
+      if (!r->live) continue;
+      /* if [-1pass] is specified, just copy from 1st pass result */
+      if (r->config->compute_only_1pass) continue;
+      /* if search already failed on 1st pass, skip 2nd pass */
+      if (r->result.status < 0) continue;
+      /* prepare result storage */
+      if (r->lmtype == LM_DFA && r->config->output.multigramout_flag) {
+ result_sentence_malloc(r, r->config->output.output_hypo_maxnum * multigram_get_all_num(r->lm));
+      } else {
+ result_sentence_malloc(r, r->config->output.output_hypo_maxnum);
+      }
+      /* do 2nd pass */
+      if (r->lmtype == LM_PROB) {
+ wchmm_fbs(r->am->mfcc->param, r, 0, 0);
+      } else if (r->lmtype == LM_DFA) {
+ if (r->config->output.multigramout_flag) {
+   /* execute 2nd pass multiple times for each grammar sequencially */
+   /* to output result for each grammar */
+   MULTIGRAM *m;
+   boolean has_success = FALSE;
+   for(m = r->lm->grammars; m; m = m->next) {
+     if (m->active) {
+       jlog("STAT: execute 2nd pass limiting words for gram #%d\n", m->id);
+       wchmm_fbs(r->am->mfcc->param, r, m->cate_begin, m->dfa->term_num);
+       if (r->result.status == J_RESULT_STATUS_SUCCESS) {
+   has_success = TRUE;
+       }
+     }
+   }
+   r->result.status = (has_success == TRUE) ? J_RESULT_STATUS_SUCCESS : J_RESULT_STATUS_FAIL;
+ } else {
+   /* only the best among all grammar will be output */
+   wchmm_fbs(r->am->mfcc->param, r, 0, r->lm->dfa->term_num);
+ }
+      }
+    }
+
+
+    /* do forced alignment if needed */
+    for(r=recog->process_list;r;r=r->next) {
+      if (!r->live) continue;
+      /* if search failed on 2nd pass, skip this */
+      if (r->result.status < 0) continue;
+      /* do needed alignment */
+      do_alignment_all(r, r->am->mfcc->param);
+    }
+
+    /* output result */
+    callback_exec(CALLBACK_RESULT, recog);
+#ifdef ENABLE_PLUGIN
+    plugin_exec_process_result(recog);
+#endif
+
+    // Processing done...
+    // Return the control to Haskell
+    return 0;
+}
+
+void j_clean_recog_work_area(Recog* recog)
+{
+  RecogProcess *r;
+  /* clear work area for output */
+  for(r=recog->process_list;r;r=r->next) {
+    if (!r->live) continue;
+    clear_result(r);
+  }
+}
+
+/**
  * <EN>
  * @brief  Recognize an input stream.
  *
