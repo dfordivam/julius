@@ -1478,7 +1478,7 @@ j_recognize_stream_core(Recog *recog)
 }
 
 int
-j_recognize_stream_simplified(Recog *recog, char* melData, int datalen)
+j_recognize_stream_simplified(Recog *recog, char* melData, int speechlen)
 {
   Jconf *jconf = recog->jconf;
   int ret;

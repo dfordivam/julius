@@ -22,6 +22,10 @@ stdenv.mkDerivation rec {
 
   nativeBuildInputs = [ perl ];
 
+  configureFlags = [
+      "--disable-openmp"
+  ];
+
   #preConfigure = ''
   #  export CFLAGS="-g"
   #'';
